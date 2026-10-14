@@ -2,92 +2,99 @@ import http from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GoogleGenAI } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '..');
 const distDir = path.join(projectRoot, 'dist');
 const port = Number(process.env.PORT || 8787);
+
+// --- Dual Engine Provider Orchestration Config ---
+// Swap engine targets on runtime by specifying AI_PROVIDER=gemini or AI_PROVIDER=ollama
+const aiProvider = (process.env.AI_PROVIDER || 'ollama').toLowerCase();
+
+// Ollama config
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
 const ollamaModel = process.env.OLLAMA_MODEL || 'llama3.1:8b';
-const strictOllamaOnly = (process.env.OLLAMA_STRICT || 'true').toLowerCase() === 'true';
+
+// Gemini config
+const geminiApiKey = process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  : null;
+const geminiModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+if (!['gemini', 'ollama'].includes(aiProvider)) {
+  throw new Error(
+    `Unsupported AI_PROVIDER "${aiProvider}". Use "gemini" or "ollama".`
+  );
+}
 
 const TOPIC_LABELS = ['Reisen', 'Arbeit', 'Essen', 'Hobbys', 'Technik', 'Alltag'];
+
+async function generateAiContent(promptText, options = {}) {
+  const { temperature = 0.7, maxOutputTokens = 800 } = options;
+
+  if (aiProvider === 'gemini') {
+    if (!geminiApiKey) {
+      throw new Error(
+        'Gemini API key is missing. Please set GEMINI_API_KEY in your environment variables.'
+      );
+    }
+
+    const response = await geminiApiKey.models.generateContent({
+      model: geminiModel,
+      contents: promptText,
+      config: {
+        temperature,
+        maxOutputTokens,
+        responseMimeType: 'application/json',
+      },
+    });
+
+    return response.text || '';
+  }
+
+  const response = await fetch(`${ollamaBaseUrl}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: ollamaModel,
+      stream: false,
+      format: 'json',
+      options: { temperature },
+      prompt: promptText,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ollama request failed with status ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.response || '';
+}
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
 function normalizeText(text) {
-  return String(text || '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
 function getLatestUserMessage(messages) {
-  if (!Array.isArray(messages)) {
-    return '';
-  }
+  if (!Array.isArray(messages)) return '';
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
+
     if (message?.role === 'user' && typeof message.text === 'string') {
       return normalizeText(message.text);
     }
   }
 
   return '';
-}
-
-function extractKeywords(text) {
-  return normalizeText(text)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\säöüß]/gu, ' ')
-    .split(/\s+/)
-    .filter((word) => word.length > 2)
-    .slice(0, 4);
-}
-
-function buildFollowUp(topicLabel, keywords, turnCount) {
-  const keywordText = keywords.length > 0 ? `Du hast ${keywords.join(', ')} erwähnt.` : 'Deine Antwort klingt interessant.';
-
-  const topicFollowUps = {
-    Reisen: [
-      'Was war dabei das Schönste für dich?',
-      'Würdest du dort noch einmal hinfahren?',
-      'Was würdest du beim nächsten Mal anders machen?',
-    ],
-    Arbeit: [
-      'Was daran war für dich am wichtigsten?',
-      'Wie würdest du das im Alltag verbessern?',
-      'Was motiviert dich an diesem Thema?',
-    ],
-    Essen: [
-      'Was macht das für dich besonders lecker?',
-      'Würdest du etwas daran ändern?',
-      'Wie oft isst du so etwas normalerweise?',
-    ],
-    Hobbys: [
-      'Was gefällt dir daran am meisten?',
-      'Seit wann machst du das schon?',
-      'Was würdest du gern als Nächstes lernen?',
-    ],
-    Technik: [
-      'Welche Funktion nutzt du am meisten?',
-      'Was müsste daran noch besser sein?',
-      'Wie hilft dir das im Alltag?',
-    ],
-    Alltag: [
-      'Wann merkst du das am stärksten?',
-      'Was würdest du daran gern ändern?',
-      'Welche kleine Gewohnheit hilft dir dabei?',
-    ],
-  };
-
-  const options = topicFollowUps[topicLabel] || topicFollowUps.Alltag;
-  const followUp = options[turnCount % options.length];
-
-  return `${keywordText} ${followUp}`.trim();
 }
 
 function jsonResponse(res, statusCode, payload) {
@@ -97,36 +104,47 @@ function jsonResponse(res, statusCode, payload) {
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   });
+
   res.end(JSON.stringify(payload));
 }
 
-function textResponse(res, statusCode, text, contentType = 'text/plain; charset=utf-8') {
+function textResponse(
+  res,
+  statusCode,
+  text,
+  contentType = 'text/plain; charset=utf-8'
+) {
   res.writeHead(statusCode, {
     'Content-Type': contentType,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   });
+
   res.end(text);
 }
 
 async function readRequestBody(req) {
-  return await new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     let body = '';
+
     req.on('data', (chunk) => {
       body += chunk;
+
       if (body.length > 1_000_000) {
         reject(new Error('Request body too large.'));
         req.destroy();
       }
     });
+
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });
 }
 
 function extractJson(text) {
-  const trimmed = text.trim();
+  const trimmed = String(text || '').trim();
+
   if (!trimmed) {
     throw new Error('Empty model response.');
   }
@@ -136,9 +154,11 @@ function extractJson(text) {
   } catch {
     const start = trimmed.indexOf('{');
     const end = trimmed.lastIndexOf('}');
+
     if (start >= 0 && end > start) {
       return JSON.parse(trimmed.slice(start, end + 1));
     }
+
     throw new Error('Model response was not valid JSON.');
   }
 }
@@ -146,21 +166,10 @@ function extractJson(text) {
 function normalizePartOfSpeech(value) {
   const normalized = normalizeText(value).toLowerCase();
 
-  if (['verb', 'verben'].includes(normalized)) {
-    return 'verb';
-  }
-
-  if (['noun', 'nomen', 'substantiv'].includes(normalized)) {
-    return 'noun';
-  }
-
-  if (['adjective', 'adjektiv'].includes(normalized)) {
-    return 'adjective';
-  }
-
-  if (['other', 'sonstiges'].includes(normalized)) {
-    return 'other';
-  }
+  if (['verb', 'verben'].includes(normalized)) return 'verb';
+  if (['noun', 'nomen', 'substantiv'].includes(normalized)) return 'noun';
+  if (['adjective', 'adjektiv'].includes(normalized)) return 'adjective';
+  if (['other', 'sonstiges'].includes(normalized)) return 'other';
 
   return 'unknown';
 }
@@ -175,9 +184,7 @@ function normalizeGenderEndings(value) {
 }
 
 function normalizeStringList(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
+  if (!Array.isArray(value)) return [];
 
   const seen = new Set();
   const result = [];
@@ -185,9 +192,9 @@ function normalizeStringList(value) {
   for (const item of value) {
     const text = normalizeText(item);
     const key = text.toLowerCase();
-    if (!text || seen.has(key)) {
-      continue;
-    }
+
+    if (!text || seen.has(key)) continue;
+
     seen.add(key);
     result.push(text);
   }
@@ -197,7 +204,9 @@ function normalizeStringList(value) {
 
 function normalizeWordForms(word, parsed) {
   const safeWord = normalizeText(word);
-  const partOfSpeech = normalizePartOfSpeech(parsed?.partOfSpeech || 'unknown');
+  const partOfSpeech = normalizePartOfSpeech(
+    parsed?.partOfSpeech || 'unknown'
+  );
 
   const base = {
     word: safeWord,
@@ -250,7 +259,12 @@ function normalizeWordForms(word, parsed) {
     base.article = '';
     base.plural = '';
     base.relatedVerbs = [];
-    base.cases = { nominativ: '', akkusativ: '', dativ: '', genitiv: '' };
+    base.cases = {
+      nominativ: '',
+      akkusativ: '',
+      dativ: '',
+      genitiv: '',
+    };
   }
 
   if (base.partOfSpeech !== 'verb') {
@@ -275,12 +289,19 @@ function normalizeWordForms(word, parsed) {
     base.comparative = '';
     base.superlative = '';
     base.commonVerbs = [];
-    const emptyEndings = { maskulin: '', feminin: '', neutrum: '', plural: '' };
+
+    const emptyEndings = {
+      maskulin: '',
+      feminin: '',
+      neutrum: '',
+      plural: '',
+    };
+
     base.declension = {
-      nominativ: emptyEndings,
-      akkusativ: emptyEndings,
-      dativ: emptyEndings,
-      genitiv: emptyEndings,
+      nominativ: { ...emptyEndings },
+      akkusativ: { ...emptyEndings },
+      dativ: { ...emptyEndings },
+      genitiv: { ...emptyEndings },
     };
   }
 
@@ -289,46 +310,23 @@ function normalizeWordForms(word, parsed) {
 
 async function extractVocabularyCandidates(sentence) {
   const safeSentence = normalizeText(sentence);
+  if (!safeSentence) return [];
 
-  if (!safeSentence) {
-    return [];
-  }
+  const prompt = [
+    'Du bist ein präziser deutscher NLP-Assistent.',
+    'Gib ausschließlich valides JSON im Format {"items":[{"word":"...","partOfSpeech":"verb|noun|adjective","lemma":"..."}]}.',
+    'Extrahiere aus dem Satz nur deutsche Verben, Nomen und Adjektive. Keine anderen Wortarten. Keine Duplikate.',
+    `Satz: ${safeSentence}`,
+  ].join('\n');
 
-  const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: ollamaModel,
-      stream: false,
-      format: 'json',
-      options: {
-        temperature: 0.1,
-      },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Du bist ein präziser deutscher NLP-Assistent. Gib ausschließlich valides JSON im Format {"items":[{"word":"...","partOfSpeech":"verb|noun|adjective","lemma":"..."}]}. Extrahiere aus dem Satz nur deutsche Verben, Nomen und Adjektive. Keine anderen Wortarten. Keine Duplikate.',
-        },
-        {
-          role: 'user',
-          content: `Satz: ${safeSentence}`,
-        },
-      ],
-    }),
-  });
+  const parsed = extractJson(
+    await generateAiContent(prompt, {
+      temperature: 0.1,
+      maxOutputTokens: 500,
+    })
+  );
 
-  if (!response.ok) {
-    throw new Error(`Ollama vocabulary extraction failed with status ${response.status}`);
-  }
-
-  const payload = await response.json();
-  const content = payload?.message?.content ?? '';
-  const parsed = extractJson(content);
   const rawItems = Array.isArray(parsed?.items) ? parsed.items : [];
-
   const seen = new Set();
   const filtered = [];
 
@@ -342,9 +340,7 @@ async function extractVocabularyCandidates(sentence) {
     }
 
     const dedupeKey = `${word.toLowerCase()}::${partOfSpeech}`;
-    if (seen.has(dedupeKey)) {
-      continue;
-    }
+    if (seen.has(dedupeKey)) continue;
 
     seen.add(dedupeKey);
     filtered.push({ word, partOfSpeech, lemma });
@@ -355,125 +351,88 @@ async function extractVocabularyCandidates(sentence) {
 
 async function getWordForms(word) {
   const safeWord = normalizeText(word);
+
   if (!safeWord) {
     throw new Error('Missing word for forms lookup.');
   }
 
-  const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: ollamaModel,
-      stream: false,
-      format: 'json',
-      options: {
-        temperature: 0.1,
-      },
-      messages: [
-        {
-          role: 'system',
-          content: [
-            'Du bist ein präziser deutscher Grammatik-Lexikon-Assistent, vergleichbar mit Duden Online.',
-            'Gib ausschließlich valides JSON zurück, exakt in dieser Struktur (fülle nur die zur Wortart passenden Felder, der Rest bleibt leerer String "" bzw. leere Liste []):',
-            '{',
-            '  "partOfSpeech": "verb|noun|adjective|other",',
-            '  "translation": "kurze, präzise englische Übersetzung des Wortes",',
-            '  "notes": "optionale kurze Zusatzhinweise, z.B. Register, Besonderheiten",',
-            '',
-            '  "article": "der|die|das (nur bei Nomen)",',
-            '  "plural": "Pluralform (nur bei Nomen)",',
-            '  "relatedVerbs": ["Verben, die häufig zusammen mit diesem Nomen verwendet werden, z.B. machen, nehmen, geben"],',
-            '  "cases": {"nominativ":"der Tisch","akkusativ":"den Tisch","dativ":"dem Tisch","genitiv":"des Tisches"},',
-            '',
-            '  "infinitive": "Infinitivform (nur bei Verben)",',
-            '  "auxiliary": "haben|sein (Hilfsverb für Perfekt, nur bei Verben)",',
-            '  "governs": "welchen Kasus das Verb regiert, z.B. Akkusativ, Dativ, Akkusativ+Dativ, oder leer",',
-            '  "present": "Präsens 3. Person Singular",',
-            '  "past": "Präteritum 3. Person Singular",',
-            '  "future": "Futur I 3. Person Singular",',
-            '  "perfect": "Perfekt 3. Person Singular, z.B. hat gegessen",',
-            '  "imperative": "Imperativ Singular (du-Form)",',
-            '  "conjugation": {"ich":"...","du":"...","erSieEs":"...","wir":"...","ihr":"...","sie":"..."} (Präsens, nur bei Verben),',
-            '',
-            '  "comparative": "Komparativform (nur bei Adjektiven)",',
-            '  "superlative": "Superlativform mit am, z.B. am schönsten (nur bei Adjektiven)",',
-            '  "commonVerbs": ["Verben, die häufig mit diesem Adjektiv verwendet werden, z.B. sein, werden, finden, aussehen"],',
-            '  "declension": {',
-            '    "nominativ": {"maskulin":"-e","feminin":"-e","neutrum":"-e","plural":"-en"},',
-            '    "akkusativ": {"maskulin":"-en","feminin":"-e","neutrum":"-e","plural":"-en"},',
-            '    "dativ": {"maskulin":"-en","feminin":"-en","neutrum":"-en","plural":"-en"},',
-            '    "genitiv": {"maskulin":"-en","feminin":"-en","neutrum":"-en","plural":"-en"}',
-            '  } (Adjektivendungen nach bestimmtem Artikel, nur bei Adjektiven)',
-            '}',
-            'Sei linguistisch korrekt und prägnant. Keine Erklärtexte außerhalb des JSON.',
-          ].join('\n'),
-        },
-        {
-          role: 'user',
-          content: `Gib alle grammatischen Informationen für dieses deutsche Wort: ${safeWord}`,
-        },
-      ],
-    }),
-  });
+  const prompt = [
+    'Du bist ein präziser deutscher Grammatik-Lexikon-Assistent, vergleichbar mit Duden Online.',
+    'Gib ausschließlich valides JSON zurück. Fülle nur die zur Wortart passenden Felder; der Rest bleibt leerer String "" bzw. leere Liste [].',
+    '{',
+    '  "partOfSpeech": "verb|noun|adjective|other",',
+    '  "translation": "kurze, präzise englische Übersetzung des Wortes",',
+    '  "notes": "optionale kurze Zusatzhinweise, z.B. Register, Besonderheiten",',
+    '  "article": "der|die|das (nur bei Nomen)",',
+    '  "plural": "Pluralform (nur bei Nomen)",',
+    '  "relatedVerbs": ["häufige Verben zusammen mit diesem Nomen"],',
+    '  "cases": {"nominativ":"der Tisch","akkusativ":"den Tisch","dativ":"dem Tisch","genitiv":"des Tisches"},',
+    '  "infinitive": "Infinitivform (nur bei Verben)",',
+    '  "auxiliary": "haben|sein (Hilfsverb für Perfekt, nur bei Verben)",',
+    '  "governs": "welchen Kasus das Verb regiert",',
+    '  "present": "Präsens 3. Person Singular",',
+    '  "past": "Präteritum 3. Person Singular",',
+    '  "future": "Futur I 3. Person Singular",',
+    '  "perfect": "Perfekt 3. Person Singular",',
+    '  "imperative": "Imperativ Singular (du-Form)",',
+    '  "conjugation": {"ich":"...","du":"...","erSieEs":"...","wir":"...","ihr":"...","sie":"..."},',
+    '  "comparative": "Komparativform",',
+    '  "superlative": "Superlativform mit am",',
+    '  "commonVerbs": ["häufige Verben mit diesem Adjektiv"],',
+    '  "declension": {',
+    '    "nominativ": {"maskulin":"","feminin":"","neutrum":"","plural":""},',
+    '    "akkusativ": {"maskulin":"","feminin":"","neutrum":"","plural":""},',
+    '    "dativ": {"maskulin":"","feminin":"","neutrum":"","plural":""},',
+    '    "genitiv": {"maskulin":"","feminin":"","neutrum":"","plural":""}',
+    '  }',
+    '}',
+    'Sei linguistisch korrekt und prägnant. Keine Erklärtexte außerhalb des JSON.',
+    `Gib alle grammatischen Informationen für dieses deutsche Wort: ${safeWord}`,
+  ].join('\n');
 
-  if (!response.ok) {
-    throw new Error(`Ollama word-form request failed with status ${response.status}`);
-  }
+  const parsed = extractJson(
+    await generateAiContent(prompt, {
+      temperature: 0.1,
+      maxOutputTokens: 1200,
+    })
+  );
 
-  const payload = await response.json();
-  const content = payload?.message?.content ?? '';
-  const parsed = extractJson(content);
   return normalizeWordForms(safeWord, parsed);
-}
-
-function fallbackReply(input) {
-  const topicLabel = TOPIC_LABELS[input.topicIndex] || 'Alltag';
-  const latestUserMessage = getLatestUserMessage(input.messages);
-  const keywords = extractKeywords(latestUserMessage);
-  const echo = latestUserMessage ? `Du hast gesagt: „${latestUserMessage}“.` : 'Danke für deine Antwort.';
-  const followUp = buildFollowUp(topicLabel, keywords, Number(input.turnCount || 0));
-
-  return {
-    reply: `${echo} ${followUp || 'Erzähl mir bitte noch etwas mehr.'}`,
-    difficulty: clamp(Number(input.difficulty || 2), 1, 5),
-    topicIndex: clamp(Number(input.topicIndex || 0), 0, TOPIC_LABELS.length - 1),
-  };
 }
 
 function buildPrompt(input) {
   const topic = input.topic || {};
   const topicLabel = topic.label || TOPIC_LABELS[input.topicIndex] || 'Alltag';
   const topicOpeners = Array.isArray(topic.followUps) ? topic.followUps : [];
-  const latestUserMessage = getLatestUserMessage(input.messages);
 
   return [
     'Du bist Deutsch Lehrer AI, ein freundlicher und entspannter deutscher Gesprächspartner für Sprachübung.',
     'Antworte nur auf Deutsch, in 1 bis 3 natürlichen Sätzen.',
     'WICHTIGSTE REGEL: Lies die gesamte bisherige Konversation (alle vorherigen Nachrichten) und beantworte zuerst wirklich das, was der Nutzer zuletzt gesagt oder gefragt hat. Gehe konkret auf den Inhalt ein, nicht nur allgemein.',
-    'Wenn der Nutzer sich auf etwas bezieht, das er oder du vorher gesagt habt (z.B. "wie ich schon sagte" oder "du hast gefragt..."), nutze den Gesprächsverlauf, um das korrekt zu erkennen und darauf einzugehen.',
-    'Sei nicht dogmatisch oder übermäßig belehrend: Du musst nicht bei jeder Antwort eine Korrektur einbauen. Korrigiere Fehler höchstens sehr subtil und nur gelegentlich, indem du die richtige Form natürlich in deiner eigenen Antwort verwendest. Bestehe nicht darauf, dass eine Formulierung "falsch" ist, wenn der Kontext unklar ist — frage im Zweifel freundlich nach, statt zu korrigieren.',
+    'Wenn der Nutzer sich auf etwas bezieht, das du vorher gesagt hast, nutze den Gesprächsverlauf, um das korrekt zu erkennen und darauf einzugehen.',
+    'Sei nicht dogmatisch oder übermäßig belehrend: Korrigiere Fehler höchstens sehr subtil und nur gelegentlich, indem du die richtige Form natürlich in deiner eigenen Antwort verwendest.',
     'Schreibe keine separate Grammatikanalyse oder Fehlerliste mitten im Gespräch.',
     'Stelle am Ende höchstens eine natürliche Rückfrage, die zum Gesagten passt, aber nur wenn es zum Gesprächsfluss passt.',
-    'Bewerte bei JEDER Antwort das tatsächlich gezeigte Sprachniveau der LETZTEN Nutzerantwort neu und unabhängig von der vorherigen Einstufung: 1=A1 (sehr einfach), 2=A2 (einfach), 3=B1 (Mittelstufe), 4=B2 (gehoben), 5=C1 (fortgeschritten). Achte auf Satzlänge, Nebensätze, Wortschatz und Grammatikgenauigkeit.',
-    'Wenn die Antwort deutlich komplexer oder einfacher ist als die bisherige Einstufung, passe den difficulty-Wert entsprechend an — auch größere Sprünge sind erlaubt, wenn klar gerechtfertigt. Rate nicht konservativ; gib den Wert zurück, der am besten zur tatsächlichen Antwort passt.',
+    'Bewerte bei JEDER Antwort das tatsächlich gezeigte Sprachniveau der LETZTEN Nutzerantwort neu: 1=A1, 2=A2, 3=B1, 4=B2, 5=C1. Achte auf Satzlänge, Nebensätze, Wortschatz und Grammatikgenauigkeit.',
+    'Wenn die Antwort deutlich komplexer oder einfacher ist als die bisherige Einstufung, passe den difficulty-Wert entsprechend an.',
     'Antworte ausschließlich mit JSON im Format {"reply":"...","difficulty":1-5,"topicIndex":0-5}.',
     `Aktuelles Thema: ${topicLabel}`,
     `Bisherige Einstufung (nur zur Orientierung, nicht bindend): ${input.difficulty}`,
     `Turn count: ${input.turnCount}`,
     `Themenhinweise: ${topicOpeners.join(' | ')}`,
-    `Letzte Nutzerantwort: ${latestUserMessage || '—'}`,
   ].join('\n');
 }
 
 function mapChatMessages(messages) {
-  if (!Array.isArray(messages)) {
-    return [];
-  }
+  if (!Array.isArray(messages)) return [];
 
   return messages
-    .filter((message) => message && typeof message.text === 'string' && message.text.trim().length > 0)
+    .filter(
+      (message) =>
+        message &&
+        typeof message.text === 'string' &&
+        message.text.trim().length > 0
+    )
     .slice(-30)
     .map((message) => ({
       role: message.role === 'coach' ? 'assistant' : 'user',
@@ -481,88 +440,115 @@ function mapChatMessages(messages) {
     }));
 }
 
-async function getOllamaReply(input) {
-  const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: ollamaModel,
-      stream: false,
-      format: 'json',
-      options: {
-        temperature: 0.7,
-      },
-      messages: [
-        { role: 'system', content: buildPrompt(input) },
-        ...mapChatMessages(input.messages),
-        {
-          role: 'user',
-          content: 'Bitte antworte jetzt auf meine letzte Nachricht im Kontext des bisherigen Gesprächs. Gib nur JSON zurück.',
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Ollama request failed with status ${response.status}`);
-  }
-
-  const payload = await response.json();
-  const content = payload?.message?.content ?? '';
-  const parsed = extractJson(content);
-
-  return {
-    reply: String(parsed.reply || 'Erzähl mir bitte noch etwas mehr auf Deutsch.'),
-    difficulty: clamp(Number(parsed.difficulty || input.difficulty || 2), 1, 5),
-    topicIndex: clamp(Number(parsed.topicIndex || input.topicIndex || 0), 0, TOPIC_LABELS.length - 1),
-  };
-}
-
 async function getAgentReply(input) {
+  const history = mapChatMessages(input.messages)
+    .map(
+      (message) =>
+        `${message.role === 'assistant' ? 'Assistent' : 'Nutzer'}: ${message.content}`
+    )
+    .join('\n');
+
+  const prompt = [
+    buildPrompt(input),
+    '',
+    'Bisheriger Gesprächsverlauf:',
+    history || '(Noch kein Gesprächsverlauf vorhanden.)',
+    '',
+    'Bitte antworte jetzt auf die letzte Nachricht im Kontext des bisherigen Gesprächs. Gib nur JSON zurück.',
+  ].join('\n');
+
   try {
-    return await getOllamaReply(input);
+    const parsed = extractJson(
+      await generateAiContent(prompt, {
+        temperature: 0.7,
+        maxOutputTokens: 500,
+      })
+    );
+
+    return {
+      reply: String(
+        parsed.reply || 'Erzähl mir bitte noch etwas mehr auf Deutsch.'
+      ),
+      difficulty: clamp(
+        Number(parsed.difficulty ?? input.difficulty ?? 2),
+        1,
+        5
+      ),
+      topicIndex: clamp(
+        Number(parsed.topicIndex ?? input.topicIndex ?? 0),
+        0,
+        TOPIC_LABELS.length - 1
+      ),
+    };
   } catch (error) {
-    console.error('Ollama failed:', error.message);
-    if (strictOllamaOnly) {
-      throw error;
-    }
-    return fallbackReply(input);
+    console.error(`${aiProvider} chat failed:`, error.message);
+    throw error;
   }
 }
 
 async function serveStatic(req, res) {
   const urlPath = new URL(req.url, `http://${req.headers.host}`).pathname;
-  const filePath = urlPath === '/' ? path.join(distDir, 'index.html') : path.join(distDir, urlPath.replace(/^\//, ''));
+  const filePath = path.resolve(
+    distDir,
+    urlPath === '/' ? 'index.html' : `.${urlPath}`
+  );
+
+  // Prevent requests from accessing files outside the dist directory.
+  if (
+    filePath !== distDir &&
+    !filePath.startsWith(`${distDir}${path.sep}`)
+  ) {
+    return textResponse(res, 403, 'Forbidden');
+  }
 
   try {
     const fileStat = await stat(filePath);
+
     if (fileStat.isDirectory()) {
       const index = await readFile(path.join(distDir, 'index.html'));
-      return textResponse(res, 200, index.toString('utf-8'), 'text/html; charset=utf-8');
+      return textResponse(
+        res,
+        200,
+        index.toString('utf-8'),
+        'text/html; charset=utf-8'
+      );
     }
 
     const content = await readFile(filePath);
     const ext = path.extname(filePath);
+
     const contentType =
       ext === '.html'
         ? 'text/html; charset=utf-8'
-        : ext === '.js'
+        : ['.js', '.mjs'].includes(ext)
           ? 'text/javascript; charset=utf-8'
           : ext === '.css'
             ? 'text/css; charset=utf-8'
             : ext === '.svg'
               ? 'image/svg+xml'
               : 'application/octet-stream';
-    textResponse(res, 200, content.toString('utf-8'), contentType);
+
+    return textResponse(
+      res,
+      200,
+      content.toString('utf-8'),
+      contentType
+    );
   } catch {
-    const index = await readFile(path.join(distDir, 'index.html')).catch(() => null);
+    const index = await readFile(
+      path.join(distDir, 'index.html')
+    ).catch(() => null);
+
     if (index) {
-      textResponse(res, 200, index.toString('utf-8'), 'text/html; charset=utf-8');
-    } else {
-      textResponse(res, 404, 'Not found');
+      return textResponse(
+        res,
+        200,
+        index.toString('utf-8'),
+        'text/html; charset=utf-8'
+      );
     }
+
+    return textResponse(res, 404, 'Not found');
   }
 }
 
@@ -577,12 +563,12 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://${req.headers.host}`);
 
+  // Health endpoint reports the currently selected AI provider.
   if (url.pathname === '/api/health' && req.method === 'GET') {
     return jsonResponse(res, 200, {
       ok: true,
-      provider: 'ollama',
-      model: ollamaModel,
-      strict: strictOllamaOnly,
+      provider: aiProvider,
+      model: aiProvider === 'gemini' ? geminiModel : ollamaModel,
     });
   }
 
@@ -591,26 +577,34 @@ const server = http.createServer(async (req, res) => {
       const body = await readRequestBody(req);
       const input = JSON.parse(body || '{}');
       const reply = await getAgentReply(input);
+
       return jsonResponse(res, 200, reply);
     } catch (error) {
       console.error('Chat API error:', error);
+
       return jsonResponse(res, 500, {
-        reply: 'Entschuldige, ich hatte gerade ein Problem. Kannst du die Frage noch einmal stellen?',
+        reply:
+          'Entschuldige, ich hatte gerade ein Problem. Kannst du die Frage noch einmal stellen?',
         difficulty: 2,
         topicIndex: 0,
       });
     }
   }
 
-  if (url.pathname === '/api/vocabulary/extract' && req.method === 'POST') {
+  if (
+    url.pathname === '/api/vocabulary/extract' &&
+    req.method === 'POST'
+  ) {
     try {
       const body = await readRequestBody(req);
       const input = JSON.parse(body || '{}');
       const sentence = normalizeText(input.sentence || '');
       const items = await extractVocabularyCandidates(sentence);
+
       return jsonResponse(res, 200, { items });
     } catch (error) {
       console.error('Vocabulary extract API error:', error);
+
       return jsonResponse(res, 502, {
         error: 'vocabulary_extraction_failed',
         items: [],
@@ -619,18 +613,22 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/api/word-forms' && req.method === 'POST') {
-    let requestedWord = 'Wetter';
+    let requestedWord = '';
+
     try {
       const body = await readRequestBody(req);
       const input = JSON.parse(body || '{}');
       requestedWord = normalizeText(input.word || '');
+
       const forms = await getWordForms(requestedWord);
+
       return jsonResponse(res, 200, forms);
     } catch (error) {
       console.error('Word forms API error:', error);
+
       return jsonResponse(res, 502, {
         error: 'word_forms_failed',
-        word: requestedWord || '',
+        word: requestedWord,
       });
     }
   }
@@ -643,6 +641,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(port, () => {
-  const mode = strictOllamaOnly ? 'strict' : 'with-fallback';
-  console.log(`Deutsch Lehrer AI backend running on http://localhost:${port} [ollama=${ollamaModel},mode=${mode}]`);
+  const model = aiProvider === 'gemini' ? geminiModel : ollamaModel;
+
+  console.log(
+    `Deutsch Lehrer AI backend running on http://localhost:${port} [provider=${aiProvider},model=${model}]`
+  );
 });

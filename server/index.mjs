@@ -3,6 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI } from '@google/genai';
+import { OpenAI } from 'openai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,15 +19,27 @@ const aiProvider = (process.env.AI_PROVIDER || 'ollama').toLowerCase();
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
 const ollamaModel = process.env.OLLAMA_MODEL || 'llama3.1:8b';
 
+// OpenRouter Config
+const openrouterClient = process.env.OPENROUTER_API_KEY
+  ? new OpenAI({
+      apiKey: process.env.OPENROUTER_API_KEY,
+      baseURL: 'https://openrouter.ai/api/v1', // This forces the openai client to target OpenRouter
+    })
+  : null;
+
+const openrouterModel = process.env.OPENROUTER_MODEL || 'google/gemma-4-31b-it:free'; 
+console.log(`Using OpenRouter model: ${openrouterModel}`);
+
 // Gemini config
 const geminiApiKey = process.env.GEMINI_API_KEY
   ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
   : null;
 const geminiModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-if (!['gemini', 'ollama'].includes(aiProvider)) {
+// Validate selection
+if (!['gemini', 'ollama', 'openrouter'].includes(aiProvider)) {
   throw new Error(
-    `Unsupported AI_PROVIDER "${aiProvider}". Use "gemini" or "ollama".`
+    `Unsupported AI_PROVIDER "${aiProvider}". Use "gemini", "ollama", or "openrouter".`
   );
 }
 
@@ -34,6 +47,24 @@ const TOPIC_LABELS = ['Reisen', 'Arbeit', 'Essen', 'Hobbys', 'Technik', 'Alltag'
 
 async function generateAiContent(promptText, options = {}) {
   const { temperature = 0.7, maxOutputTokens = 800 } = options;
+
+  if (aiProvider === 'openrouter') {
+    if (!openrouterClient) {
+      throw new Error(
+        'OpenRouter API key is missing. Please set OPENROUTER_API_KEY in your environment variables.'
+      );
+    }
+
+    const response = await openrouterClient.chat.completions.create({
+      model: openrouterModel,
+      messages: [{ role: 'user', content: promptText }],
+      temperature,
+      response_format: { type: 'json_object' },
+      max_tokens: maxOutputTokens,
+    });
+
+    return response.choices[0]?.message?.content || '';
+  }
 
   if (aiProvider === 'gemini') {
     if (!geminiApiKey) {
@@ -647,3 +678,5 @@ server.listen(port, () => {
     `Deutsch Lehrer AI backend running on http://localhost:${port} [provider=${aiProvider},model=${model}]`
   );
 });
+
+export default server;

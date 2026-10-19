@@ -125,38 +125,38 @@ function App() {
     };
   }, []);
 
-  function fetchWordDetails(word: string) {
-    setLoadingWordForms((current) => ({ ...current, [word]: true }));
-    setFailedWordForms((current) => ({ ...current, [word]: false }));
+  // function fetchWordDetails(word: string) {
+  //   setLoadingWordForms((current) => ({ ...current, [word]: true }));
+  //   setFailedWordForms((current) => ({ ...current, [word]: false }));
 
-    void requestWordForms(word)
-      .then((forms) => {
-        setVocabularyBank((current) => ({
-          ...current,
-          entries: current.entries.map((entry) => (entry.word === word ? { ...entry, forms } : entry)),
-        }));
-      })
-      .catch((error) => {
-        console.error(`Failed to fetch details for "${word}":`, error);
-        setFailedWordForms((current) => ({ ...current, [word]: true }));
-      })
-      .finally(() => {
-        setLoadingWordForms((current) => ({ ...current, [word]: false }));
-      });
-  }
+  //   void requestWordForms(word)
+  //     .then((forms) => {
+  //       setVocabularyBank((current) => ({
+  //         ...current,
+  //         entries: current.entries.map((entry) => (entry.word === word ? { ...entry, forms } : entry)),
+  //       }));
+  //     })
+  //     .catch((error) => {
+  //       console.error(`Failed to fetch details for "${word}":`, error);
+  //       setFailedWordForms((current) => ({ ...current, [word]: true }));
+  //     })
+  //     .finally(() => {
+  //       setLoadingWordForms((current) => ({ ...current, [word]: false }));
+  //     });
+  // }
 
-  function toggleWordDetails(entry: VocabularyEntry) {
-    if (expandedWord === entry.word) {
-      setExpandedWord(null);
-      return;
-    }
+  // function toggleWordDetails(entry: VocabularyEntry) {
+  //   if (expandedWord === entry.word) {
+  //     setExpandedWord(null);
+  //     return;
+  //   }
 
-    setExpandedWord(entry.word);
+  //   setExpandedWord(entry.word);
 
-    if (!entry.forms && !loadingWordForms[entry.word]) {
-      fetchWordDetails(entry.word);
-    }
-  }
+  //   if (!entry.forms && !loadingWordForms[entry.word]) {
+  //     fetchWordDetails(entry.word);
+  //   }
+  // }
 
   function chooseNextTopic(nextTurnCount: number): number {
     if (nextTurnCount > 0 && nextTurnCount % 3 === 0) {
@@ -607,12 +607,12 @@ function App() {
 
                       return (
                         <div key={entry.word} className={`rounded-lg ${isDarkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
-                          <button
+                          {/* <button
                             type="button"
                             onClick={() => toggleWordDetails(entry)}
                             className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm"
                             aria-expanded={isOpen}
-                          >
+                          > */}
                             <span className="flex min-w-0 items-center gap-2">
                               <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${posBadgeColor}`}>
                                 {entry.partOfSpeech ? entry.partOfSpeech.slice(0, 4) : '?'}
@@ -620,10 +620,10 @@ function App() {
                               <span className="truncate font-semibold text-purple-400">{entry.word}</span>
                               <span className="text-xs opacity-60">×{entry.frequency}</span>
                             </span>
-                            <span className={`shrink-0 text-xs transition-transform ${isOpen ? 'rotate-180' : ''}`}>▾</span>
-                          </button>
+                            {/* <span className={`shrink-0 text-xs transition-transform ${isOpen ? 'rotate-180' : ''}`}>▾</span> */}
+                          {/* </button> */}
 
-                          {isOpen ? (
+                          {/* {isOpen ? (
                             <div className={`space-y-2 border-t px-3 py-3 text-xs ${isDarkMode ? 'border-slate-700' : 'border-slate-200'}`}>
                               <p className="opacity-70">Context: <span className="italic">"{entry.context.slice(0, 90)}{entry.context.length > 90 ? '…' : ''}"</span></p>
 
@@ -764,7 +764,7 @@ function App() {
                                 <p className="opacity-70">No details loaded yet.</p>
                               )}
                             </div>
-                          ) : null}
+                          ) : null} */}
                         </div>
                       );
                     })}

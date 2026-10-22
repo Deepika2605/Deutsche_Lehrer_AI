@@ -10,52 +10,89 @@ const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '..');
 const distDir = path.join(projectRoot, 'dist');
 const port = Number(process.env.PORT || 8787);
+const isVercel = Boolean(process.env.VERCEL);
+const isDirectRun =
+  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === __filename;
 
-// --- Dual Engine Provider Orchestration Config ---
-// Swap engine targets on runtime by specifying AI_PROVIDER=gemini or AI_PROVIDER=ollama
+const SUPPORTED_PROVIDERS = ['gemini', 'ollama', 'openrouter'];
+const TOPIC_LABELS = ['Reisen', 'Arbeit', 'Essen', 'Hobbys', 'Technik', 'Alltag'];
+
 const aiProvider = (process.env.AI_PROVIDER || 'ollama').toLowerCase();
-
-// Ollama config
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
 const ollamaModel = process.env.OLLAMA_MODEL || 'llama3.1:8b';
-
-// OpenRouter Config
-const openrouterClient = process.env.OPENROUTER_API_KEY
-  ? new OpenAI({
-      apiKey: process.env.OPENROUTER_API_KEY,
-      baseURL: 'https://openrouter.ai/api/v1', // This forces the openai client to target OpenRouter
-    })
-  : null;
-
-const openrouterModel = process.env.OPENROUTER_MODEL || 'google/gemma-4-31b-it:free'; 
-console.log(`Using OpenRouter model: ${openrouterModel}`);
-
-// Gemini config
-const geminiApiKey = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
-  : null;
+const openrouterModel =
+  process.env.OPENROUTER_MODEL || 'google/gemma-4-31b-it:free';
 const geminiModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-// Validate selection
-if (!['gemini', 'ollama', 'openrouter'].includes(aiProvider)) {
-  throw new Error(
-    `Unsupported AI_PROVIDER "${aiProvider}". Use "gemini", "ollama", or "openrouter".`
-  );
+let openrouterClient = null;
+let geminiClient = null;
+
+function log(level, event, details = {}) {
+  const payload = JSON.stringify({
+    level,
+    event,
+    ts: new Date().toISOString(),
+    ...details,
+  });
+
+  if (level === 'error') {
+    console.error(payload);
+    return;
+  }
+
+  console.log(payload);
 }
 
-const TOPIC_LABELS = ['Reisen', 'Arbeit', 'Essen', 'Hobbys', 'Technik', 'Alltag'];
+function getActiveModel() {
+  if (aiProvider === 'gemini') return geminiModel;
+  if (aiProvider === 'openrouter') return openrouterModel;
+  return ollamaModel;
+}
+
+function getOpenRouterClient() {
+  if (!process.env.OPENROUTER_API_KEY) {
+    throw new Error(
+      'OpenRouter API key is missing. Please set OPENROUTER_API_KEY in your environment variables.'
+    );
+  }
+
+  if (!openrouterClient) {
+    openrouterClient = new OpenAI({
+      apiKey: process.env.OPENROUTER_API_KEY,
+      baseURL: 'https://openrouter.ai/api/v1',
+    });
+  }
+
+  return openrouterClient;
+}
+
+function getGeminiClient() {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error(
+      'Gemini API key is missing. Please set GEMINI_API_KEY in your environment variables.'
+    );
+  }
+
+  if (!geminiClient) {
+    geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  }
+
+  return geminiClient;
+}
+
+function assertSupportedProvider() {
+  if (!SUPPORTED_PROVIDERS.includes(aiProvider)) {
+    throw new Error(
+      `Unsupported AI_PROVIDER "${aiProvider}". Use "gemini", "ollama", or "openrouter".`
+    );
+  }
+}
 
 async function generateAiContent(promptText, options = {}) {
   const { temperature = 0.7, maxOutputTokens = 800 } = options;
 
   if (aiProvider === 'openrouter') {
-    if (!openrouterClient) {
-      throw new Error(
-        'OpenRouter API key is missing. Please set OPENROUTER_API_KEY in your environment variables.'
-      );
-    }
-
-    const response = await openrouterClient.chat.completions.create({
+    const response = await getOpenRouterClient().chat.completions.create({
       model: openrouterModel,
       messages: [{ role: 'user', content: promptText }],
       temperature,
@@ -67,13 +104,7 @@ async function generateAiContent(promptText, options = {}) {
   }
 
   if (aiProvider === 'gemini') {
-    if (!geminiApiKey) {
-      throw new Error(
-        'Gemini API key is missing. Please set GEMINI_API_KEY in your environment variables.'
-      );
-    }
-
-    const response = await geminiApiKey.models.generateContent({
+    const response = await getGeminiClient().models.generateContent({
       model: geminiModel,
       contents: promptText,
       config: {
@@ -110,24 +141,6 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function normalizeText(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
-}
-
-function getLatestUserMessage(messages) {
-  if (!Array.isArray(messages)) return '';
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-
-    if (message?.role === 'user' && typeof message.text === 'string') {
-      return normalizeText(message.text);
-    }
-  }
-
-  return '';
-}
-
 function jsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -156,6 +169,18 @@ function textResponse(
 }
 
 async function readRequestBody(req) {
+  if (req.body !== undefined) {
+    if (Buffer.isBuffer(req.body)) {
+      return req.body.toString('utf8');
+    }
+
+    if (typeof req.body === 'string') {
+      return req.body;
+    }
+
+    return JSON.stringify(req.body);
+  }
+
   return new Promise((resolve, reject) => {
     let body = '';
 
@@ -171,6 +196,16 @@ async function readRequestBody(req) {
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });
+}
+
+async function readJsonBody(req) {
+  const raw = await readRequestBody(req);
+
+  if (raw && typeof raw === 'object' && !Buffer.isBuffer(raw)) {
+    return raw;
+  }
+
+  return JSON.parse(raw || '{}');
 }
 
 function extractJson(text) {
@@ -251,33 +286,32 @@ async function getAgentReply(input) {
     'Bitte antworte jetzt auf die letzte Nachricht im Kontext des bisherigen Gesprächs. Gib nur JSON zurück.',
   ].join('\n');
 
-  try {
-    const parsed = extractJson(
-      await generateAiContent(prompt, {
-        temperature: 0.7,
-        maxOutputTokens: 500,
-      })
-    );
+  const started = Date.now();
+  const parsed = extractJson(
+    await generateAiContent(prompt, {
+      temperature: 0.7,
+      maxOutputTokens: 500,
+    })
+  );
 
-    return {
-      reply: String(
-        parsed.reply || 'Erzähl mir bitte noch etwas mehr auf Deutsch.'
-      ),
-      difficulty: clamp(
-        Number(parsed.difficulty ?? input.difficulty ?? 2),
-        1,
-        5
-      ),
-      topicIndex: clamp(
-        Number(parsed.topicIndex ?? input.topicIndex ?? 0),
-        0,
-        TOPIC_LABELS.length - 1
-      ),
-    };
-  } catch (error) {
-    console.error(`${aiProvider} chat failed:`, error.message);
-    throw error;
-  }
+  log('info', 'chat_model_ok', {
+    provider: aiProvider,
+    model: getActiveModel(),
+    ms: Date.now() - started,
+    historyTurns: mapChatMessages(input.messages).length,
+  });
+
+  return {
+    reply: String(
+      parsed.reply || 'Erzähl mir bitte noch etwas mehr auf Deutsch.'
+    ),
+    difficulty: clamp(Number(parsed.difficulty ?? input.difficulty ?? 2), 1, 5),
+    topicIndex: clamp(
+      Number(parsed.topicIndex ?? input.topicIndex ?? 0),
+      0,
+      TOPIC_LABELS.length - 1
+    ),
+  };
 }
 
 async function serveStatic(req, res) {
@@ -287,11 +321,7 @@ async function serveStatic(req, res) {
     urlPath === '/' ? 'index.html' : `.${urlPath}`
   );
 
-  // Prevent requests from accessing files outside the dist directory.
-  if (
-    filePath !== distDir &&
-    !filePath.startsWith(`${distDir}${path.sep}`)
-  ) {
+  if (filePath !== distDir && !filePath.startsWith(`${distDir}${path.sep}`)) {
     return textResponse(res, 403, 'Forbidden');
   }
 
@@ -310,7 +340,6 @@ async function serveStatic(req, res) {
 
     const content = await readFile(filePath);
     const ext = path.extname(filePath);
-
     const contentType =
       ext === '.html'
         ? 'text/html; charset=utf-8'
@@ -322,16 +351,11 @@ async function serveStatic(req, res) {
               ? 'image/svg+xml'
               : 'application/octet-stream';
 
-    return textResponse(
-      res,
-      200,
-      content.toString('utf-8'),
-      contentType
-    );
+    return textResponse(res, 200, content.toString('utf-8'), contentType);
   } catch {
-    const index = await readFile(
-      path.join(distDir, 'index.html')
-    ).catch(() => null);
+    const index = await readFile(path.join(distDir, 'index.html')).catch(
+      () => null
+    );
 
     if (index) {
       return textResponse(
@@ -346,58 +370,133 @@ async function serveStatic(req, res) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+function createApiHandler(routePath, allowedMethods, impl) {
+  return async function routeHandler(req, res) {
+    const started = Date.now();
+    const method = req.method || 'GET';
+
+    log('info', 'request_start', {
+      method,
+      path: routePath,
+      provider: aiProvider,
+    });
+
+    try {
+      if (method === 'OPTIONS') {
+        return textResponse(res, 204, '');
+      }
+
+      if (!allowedMethods.includes(method)) {
+        return jsonResponse(res, 405, { error: `Method ${method} not allowed` });
+      }
+
+      assertSupportedProvider();
+      return await impl(req, res);
+    } catch (error) {
+      log('error', 'request_failed', {
+        method,
+        path: routePath,
+        provider: aiProvider,
+        model: getActiveModel(),
+        message: error.message,
+      });
+
+      if (routePath === '/api/chat') {
+        return jsonResponse(res, 500, {
+          reply:
+            'Entschuldige, ich hatte gerade ein Problem. Kannst du die Frage noch einmal stellen?',
+          difficulty: 2,
+          topicIndex: 0,
+        });
+      }
+
+      return jsonResponse(res, 500, { error: error.message || 'Server error' });
+    } finally {
+      log('info', 'request_end', {
+        method,
+        path: routePath,
+        status: res.statusCode || 0,
+        ms: Date.now() - started,
+        provider: aiProvider,
+      });
+    }
+  };
+}
+
+export const handleHealth = createApiHandler(
+  '/api/health',
+  ['GET'],
+  async (_req, res) =>
+    jsonResponse(res, 200, {
+      ok: true,
+      provider: aiProvider,
+      model: getActiveModel(),
+    })
+);
+
+export const handleChat = createApiHandler(
+  '/api/chat',
+  ['POST'],
+  async (req, res) => {
+    const input = await readJsonBody(req);
+    const reply = await getAgentReply(input);
+    return jsonResponse(res, 200, reply);
+  }
+);
+
+// Vocabulary is deferred. Add api/vocabulary/extract.mjs and api/word-forms.mjs
+// later, then wire them here the same way as handleHealth / handleChat.
+//
+// export const handleVocabularyExtract = createApiHandler(
+//   '/api/vocabulary/extract',
+//   ['POST'],
+//   async (req, res) => {
+//     const input = await readJsonBody(req);
+//     const items = await extractVocabulary(input.sentence);
+//     return jsonResponse(res, 200, { items });
+//   }
+// );
+//
+// export const handleWordForms = createApiHandler(
+//   '/api/word-forms',
+//   ['POST'],
+//   async (req, res) => {
+//     const input = await readJsonBody(req);
+//     const forms = await getWordForms(input.word);
+//     return jsonResponse(res, 200, forms);
+//   }
+// );
+
+export default async function handler(req, res) {
   if (!req.url) {
     return textResponse(res, 400, 'Invalid request');
   }
 
-  if (req.method === 'OPTIONS') {
-    return textResponse(res, 204, '');
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  if (url.pathname === '/api/health') {
+    return handleHealth(req, res);
   }
 
-  const url = new URL(req.url, `http://${req.headers.host}`);
-
-  // Health endpoint reports the currently selected AI provider.
-  if (url.pathname === '/api/health' && req.method === 'GET') {
-    return jsonResponse(res, 200, {
-      ok: true,
-      provider: aiProvider,
-      model: aiProvider === 'gemini' ? geminiModel : ollamaModel,
-    });
+  if (url.pathname === '/api/chat') {
+    return handleChat(req, res);
   }
 
-  if (url.pathname === '/api/chat' && req.method === 'POST') {
-    try {
-      const body = await readRequestBody(req);
-      const input = JSON.parse(body || '{}');
-      const reply = await getAgentReply(input);
-
-      return jsonResponse(res, 200, reply);
-    } catch (error) {
-      console.error('Chat API error:', error);
-
-      return jsonResponse(res, 500, {
-        reply:
-          'Entschuldige, ich hatte gerade ein Problem. Kannst du die Frage noch einmal stellen?',
-        difficulty: 2,
-        topicIndex: 0,
-      });
-    }
-  }
-
-  if (req.method === 'GET') {
+  if (!isVercel && (req.method || 'GET') === 'GET') {
     return serveStatic(req, res);
   }
 
   return textResponse(res, 404, 'Not found');
-});
+}
 
-server.listen(port, () => {
-  const model = aiProvider === 'gemini' ? geminiModel : ollamaModel;
+if (isDirectRun && !isVercel) {
+  assertSupportedProvider();
 
-  console.log(
-    `Deutsch Lehrer AI backend running on http://localhost:${port} [provider=${aiProvider},model=${model}]`
-  );
-});
-
-export default server;
+  http.createServer(handler).listen(port, () => {
+    log('info', 'local_listen', {
+      port,
+      provider: aiProvider,
+      model: getActiveModel(),
+    });
+  });
+}
